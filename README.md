@@ -1,2 +1,2 @@
-# kafka-vbr-producer
-Variable bitrate (VBR) producer for Apache Kafka
+# kafka-vt-producer
+Variable throughput (VT) producer for Apache Kafka
