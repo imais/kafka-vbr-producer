@@ -6,6 +6,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 #include <librdkafka/rdkafka.h>
+#include <pthread.h>
 #include "ini.h"        /* https://github.com/benhoyt/inih */
 
 /* Kafka producer based on rdfkafka_simple_producer.c from librdkafka */
@@ -16,53 +17,54 @@
 #define FALSE   0
 #define MATCH(s, n) strcasecmp(section, s) == 0 && strcasecmp(name, n) == 0
 
-#define THROUGHPUT_CHECK_INTERVAL_SEC   1
+#define THROUGHPUT_CHECK_INTERVAL_MSEC   100
 #define MSG_BUFLEN             512
 #define THROUGHPUT_BUFLEN      512
 
 
-
 typedef enum {
-    ThroughputUnit_BYTES = 0,
-    ThroughputUnit_KBYTES,
-    ThroughputUnit_MBYTES,
-    ThroughputUnit_GBYTES
-} ThroughputUnit;
+    BYTES = 0,
+    KBYTES,
+    MBYTES,
+    GBYTES
+} throughput_unit_t;
 static char *throughput_unit_str[4] = {"bytes", "kbytes", "mbytes", "gbytes"};
 static int throughput_unit_conversion[4] = {1, 1e3, 1e6, 1e9};
 
 typedef struct {
     char *brokers;              /* CSV list of brokers (host:port) */
     char *topic;
-    ThroughputUnit throughput_unit;
+    char *batch_num_messages;
+    throughput_unit_t throughput_unit;
     int throughput_interval_sec;
     char *throughput_file;
     char *message_file;
     int message_loop;
-} ProducerConfig;
+} producer_conf_t;
 static char *message_loop_str[2] = {"false", "true"};
 
 /* global variables */
-static ProducerConfig prod_conf;
+static producer_conf_t prod_conf;
 static int run = 1;
-static long time_start = 0, time_lastcheck = 0;
+static long time_start = 0, time_lastcheck = 0, time_status_lastprint = 0;
 static long bytes_sent = 0;
-static FILE *throughput_fp = NULL;
+static int msgs_sent = 0;
+static FILE *throughput_fp = NULL, *message_fp = NULL;
 static int throughput_lineno = 0;
 static float throughput_target = 0;
-static FILE *message_fp = NULL;
 
 
 static
-void release_config(ProducerConfig *conf) {
-    if (conf->brokers)          free(conf->brokers);
-    if (conf->topic)            free(conf->topic);
-    if (conf->throughput_file)  free(conf->throughput_file);
-    if (conf->message_file)     free(conf->message_file);
+void release_config(producer_conf_t *conf) {
+    if (conf->brokers)                  free(conf->brokers);
+    if (conf->topic)                    free(conf->topic);
+    if (conf->batch_num_messages)       free(conf->batch_num_messages);
+    if (conf->throughput_file)          free(conf->throughput_file);
+    if (conf->message_file)             free(conf->message_file);
 }
 
 static
-void print_config(ProducerConfig *conf) {
+void print_config(producer_conf_t *conf) {
     printf("Producer configurations:\n");
     printf("\tbrokers=%s, topic=%s\n", conf->brokers, conf->topic);
     printf("\tthroughput_unit=%s, throughput_file=%s\n",
@@ -73,21 +75,24 @@ void print_config(ProducerConfig *conf) {
 
 static
 int parse_config(void* user, const char* section, const char* name, const char* value) {
-    ProducerConfig *conf = (ProducerConfig *)user;
+    producer_conf_t *conf = (producer_conf_t *)user;
+    /* printf("section=%s, name=%s, value=%s\n", section, name, value); */
 
-    if (MATCH("kafka", "brokers"))              
+    if (MATCH("kafka", "brokers"))           
         conf->brokers = strdup(value);
-    else if (MATCH("kafka", "topic"))           
+    else if (MATCH("kafka", "topic"))
         conf->topic = strdup(value);
+    else if (MATCH("kafka", "batch.num.messages"))
+        conf->batch_num_messages = strdup(value);
     else if (MATCH("throughput", "unit")) {
         if (strcasecmp(value, "bytes") == 0 || strcasecmp(value, "b") == 0)
-            conf->throughput_unit = ThroughputUnit_BYTES;
+            conf->throughput_unit = BYTES;
         else if (strcasecmp(value, "kbytes") == 0 || strcasecmp(value, "kb") == 0)
-            conf->throughput_unit = ThroughputUnit_KBYTES;
+            conf->throughput_unit = KBYTES;
         else if (strcasecmp(value, "mbytes") == 0 || strcasecmp(value, "mb") == 0)
-            conf->throughput_unit = ThroughputUnit_MBYTES;
+            conf->throughput_unit = MBYTES;
         else if (strcasecmp(value, "gbytes") == 0 || strcasecmp(value, "gb") == 0)
-            conf->throughput_unit = ThroughputUnit_GBYTES;
+            conf->throughput_unit = GBYTES;
         else {
             fprintf(stderr, "%% Illegal unit option: %s\n", optarg);
             goto illegal_config;
@@ -120,7 +125,7 @@ illegal_config:
 
 static void stop (int signal) {
     run = 0;
-    fprintf(stderr, "%% Stopping producer...");
+    fprintf(stderr, "%% Stopping producer...\n");
 }
 
 static long get_current_time_msec() {
@@ -133,15 +138,18 @@ static float get_throughput_target(long time_curr) {
     /* returns throughput target in bytes/sec */
 
     char buf[THROUGHPUT_BUFLEN];
-    int lineno = (time_curr - time_start) / (1000 * prod_conf.throughput_interval_sec);
+    int lineno = 1 + (time_curr - time_start) / (1000 * prod_conf.throughput_interval_sec);
 
-    if (throughput_lineno >= lineno)
+    if (throughput_target > 0.0 && throughput_lineno >= lineno)
         return throughput_target;
 
     while (throughput_lineno < lineno) {
         if (fgets(buf, THROUGHPUT_BUFLEN, throughput_fp) == NULL) {
-            fprintf(stderr, "%% Failed to read throughput file\n");
-            return -1.0;
+            if (ferror(throughput_fp))
+                fprintf(stderr, "%% Failed to read throughput file\n");
+            else if (feof(throughput_fp))
+                fprintf(stderr, "%% Reached end of throughput file\n");
+            return -1;
         }
         throughput_lineno++;
     }
@@ -168,35 +176,40 @@ static int read_message(char *buf) {
 
 static 
 void msg_callback (rd_kafka_t *rk, const rd_kafka_message_t *rkmessage, void *opaque) {
+    /* NOTE: This function is called in the context of main thread */
     long time_curr, time_delta, time_wait;
-    float throughput_target, throughput_curr;
+    float throughput_target, throughput_curr, throughput_adjusted;
+    
+    if (!run)
+        return;
 
     if (rkmessage->err)
         fprintf(stderr, "%% Message delivery failed: %s\n", rd_kafka_err2str(rkmessage->err));
     else {
         bytes_sent += rkmessage->len;
+        msgs_sent++;
         time_curr = get_current_time_msec();
+        time_delta = time_curr - time_lastcheck;
 
-        if (time_curr - time_lastcheck >= THROUGHPUT_CHECK_INTERVAL_SEC * 1000) {
-            time_delta = time_curr - time_lastcheck;
+        if (time_delta >= THROUGHPUT_CHECK_INTERVAL_MSEC) {
             if ((throughput_target = get_throughput_target(time_curr)) < 0) {
                 stop(0);
                 return;
             }
-            throughput_curr = bytes_sent / time_delta;
+            throughput_curr = (float)bytes_sent / time_delta;
+
             if (throughput_target < throughput_curr) {
                 /* Rate control: wait some time to adjust throughput */
                 time_wait = bytes_sent / throughput_target - time_delta;
-                printf("throughput (target = %.3f, curr = %.3f) bytes/s, time_wait = %ld ms\n", throughput_target, throughput_target, time_wait);
+                /* printf("Sent %d msgs (%ld bytes) in %ld ms, tp(tgt: %.2f, cur: %.2f bytes/s), t_wait = %ld ms\n", msgs_sent, bytes_sent, time_delta, throughput_target, throughput_curr, time_wait); */
                 usleep(time_wait * 1000);
+                throughput_adjusted = (float)bytes_sent / (get_current_time_msec() - time_lastcheck);
+                printf("Throughput: target %.2f vs. adjusted %.2f %s/s\n",
+                       throughput_target, throughput_adjusted, 
+                       throughput_unit_str[prod_conf.throughput_unit]);
             }
-            else {
-                /* No chance to control throughput */
-                fprintf(stderr, "%% Cannot achieve target throughput (target: %.3f vs. current: %.3f)\n", throughput_target, throughput_curr);
-                /* TODO: adjust Kafka producer parameter if possible */
-            }
-
             bytes_sent = 0;
+            msgs_sent = 0;
             time_lastcheck = time_curr;
         }
     }
@@ -212,23 +225,26 @@ int main (int argc, char** argv) {
     char errstr[512];           /* librdkafka API error reporting buffer */
     char msgbuf[MSG_BUFLEN];    /* Message value temporary buffer */
     int retval = EXIT_SUCCESS;
+    long time_curr;
 
     if (argc < 2) {
         fprintf(stderr, "Usage: %s [init file]\n", argv[0]);
         exit(EXIT_FAILURE);
     }
 
+    printf("main thread ID: %u\n", (unsigned int)pthread_self());
+
     /* Signal handler for clean shutdown */
     signal(SIGINT, stop);    
 
     /* Initialize producer configurations */
-    bzero(&prod_conf, sizeof(ProducerConfig));
+    bzero(&prod_conf, sizeof(producer_conf_t));
     if (ini_parse(argv[1], parse_config, &prod_conf) != SUCCESS) {
         fprintf(stderr, "%% Failed parsing %s\n", argv[1]);
         exit(EXIT_FAILURE);
     }
     print_config(&prod_conf);
-    time_start = get_current_time_msec();
+    time_start = time_lastcheck = get_current_time_msec();
     
     /* Open throughput and message files */
     if ((throughput_fp = fopen(prod_conf.throughput_file, "r")) == NULL) {
@@ -242,9 +258,15 @@ int main (int argc, char** argv) {
         goto exit;
     }
 
-    /* Create Kafka config and setup callback */
+    /* Set Kafka configurations and setup callback */
     kafka_conf = rd_kafka_conf_new();
     if (rd_kafka_conf_set(kafka_conf, "bootstrap.servers", prod_conf.brokers,
+                          errstr, sizeof(errstr)) != RD_KAFKA_CONF_OK) {
+        fprintf(stderr, "%% %s\n", errstr);
+        retval = EXIT_FAILURE;
+        goto exit;
+    }
+    if (rd_kafka_conf_set(kafka_conf, "batch.num.messages", prod_conf.batch_num_messages,
                           errstr, sizeof(errstr)) != RD_KAFKA_CONF_OK) {
         fprintf(stderr, "%% %s\n", errstr);
         retval = EXIT_FAILURE;
@@ -276,22 +298,36 @@ int main (int argc, char** argv) {
             break;
         }
 
+        #if 0
+        time_curr = get_current_time_msec();        
+        if (time_curr - time_status_lastprint > STATUS_PRINT_INTERVAL_SEC * 1000) {
+            printf("time=%ld, msgs_sent_total=%d, bytes_sent_total=%ld\n", 
+                   time_curr, msgs_sent_total, bytes_sent_total);
+            time_status_lastprint = time_curr;
+        }
+        #endif
+
     retry:
         if (rd_kafka_produce(rkt, RD_KAFKA_PARTITION_UA, RD_KAFKA_MSG_F_COPY,
                              msgbuf, len, NULL, 0, NULL) == -1) {
-            /* Failed to *enqueue* message for producing */
-            fprintf(stderr, "%% Failed to produce to topic %s: %s\n",
-                    rd_kafka_topic_name(rkt),
-                    rd_kafka_err2str(rd_kafka_last_error()));
+            /* /\* Failed to *enqueue* message for producing *\/ */
+            /* fprintf(stderr, "%% Failed to produce to topic %s: %s\n", */
+            /*         rd_kafka_topic_name(rkt), */
+            /*         rd_kafka_err2str(rd_kafka_last_error())); */
 
             /* Poll to handle delivery reports */
             if (rd_kafka_last_error() == RD_KAFKA_RESP_ERR__QUEUE_FULL) {
                 rd_kafka_poll(rk, 1000 /*block for max 1000ms*/);
                 goto retry;
             }
-        } else {
-            rd_kafka_poll(rk, 0 /*non-blocking*/);
+        } 
+        #if 0
+        else {
+            fprintf(stderr, "%% Enqueued message (%zd bytes) for topic %s\n",
+                    len, rd_kafka_topic_name(rkt));
         }
+        #endif
+        rd_kafka_poll(rk, 0 /*non-blocking*/);
     }    
 
     fprintf(stderr, "%% Flushing final messages..\n");
@@ -308,6 +344,8 @@ exit:
         fclose(throughput_fp);
     if (message_fp)
         fclose(message_fp);    
+
+    printf("All done!\n");
 
     return retval;
 }
