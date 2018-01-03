@@ -216,7 +216,21 @@ static int read_msg(char *buf) {
 }
 
 static int read_adsb_msg(char *buf) {
-    return 0;
+    int len = read_msg(buf);
+
+    if (len == 0)
+        return 0;
+
+    char *substr = NULL, date[16];
+    long time_msg;
+    if ((substr = strstr(buf, "Date")) != NULL) {
+        /* format: Date(1503792024389) */
+        memcpy(date, substr + 5, 13);
+        date[13] = '\0';
+        time_msg = atoll(date);
+    }
+
+    return len;
 }
 
 static int read_tweets_msg(char *buf) {
