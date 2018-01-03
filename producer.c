@@ -204,9 +204,8 @@ void msg_callback (rd_kafka_t *rk, const rd_kafka_message_t *rkmessage, void *op
                 /* printf("Sent %d msgs (%ld bytes) in %ld ms, tp(tgt: %.2f, cur: %.2f bytes/s), t_wait = %ld ms\n", msgs_sent, bytes_sent, time_delta, throughput_target, throughput_curr, time_wait); */
                 usleep(time_wait * 1000);
                 throughput_adjusted = (float)bytes_sent / (get_current_time_msec() - time_lastcheck);
-                printf("Throughput: target %.2f vs. adjusted %.2f %s/s\n",
-                       throughput_target, throughput_adjusted, 
-                       throughput_unit_str[prod_conf.throughput_unit]);
+                printf("Throughput: target %.2f vs. adjusted %.2f bytes/s\n",
+                       throughput_target, throughput_adjusted);
             }
             bytes_sent = 0;
             msgs_sent = 0;
@@ -228,7 +227,7 @@ int main (int argc, char** argv) {
     long time_curr;
 
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s [init file]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [.ini file]\n", argv[0]);
         exit(EXIT_FAILURE);
     }
 
