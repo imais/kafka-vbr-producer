@@ -204,8 +204,8 @@ void msg_callback (rd_kafka_t *rk, const rd_kafka_message_t *rkmessage, void *op
     long time_curr, time_check_delta, time_print_delta, time_wait;
     float throughput_curr, throughput_adjusted;
 
-    /* rd_kafka_resp_err_t *errp = (rd_kafka_resp_err_t *)mopaque; */
-    /* *errp = err; */
+    rd_kafka_resp_err_t *errp = (rd_kafka_resp_err_t *)(rkmessage->_private);
+    *errp = rkmessage->err;
     
     if (!run)
         return;
@@ -217,7 +217,7 @@ void msg_callback (rd_kafka_t *rk, const rd_kafka_message_t *rkmessage, void *op
         bytes_print_sent += rkmessage->len;
         msgs_sent++;
 
-        usleep(prod_conf.delay_usec); /* delay send */
+        /* usleep(prod_conf.delay_usec); /\* delay send *\/ */
 
         time_curr = get_current_time_msec();
         time_check_delta = time_curr - time_check_last; /* ms */
@@ -259,21 +259,21 @@ void msg_callback (rd_kafka_t *rk, const rd_kafka_message_t *rkmessage, void *op
     /* The rkmessage is destroyed automatically by librdkafka */
 }
 
-#if 0
-rd_kafka_resp_err_t sync_produce (rd_kafka_topic_t *rkt, int32_t partition,
+rd_kafka_resp_err_t sync_produce (rd_kafka_t* rk, rd_kafka_topic_t *rkt, int32_t partition,
                                   void *payload, size_t len,
                                   const void *key, size_t keylen) {
+    /* https://github.com/edenhill/librdkafka/wiki/Sync-producer */
     rd_kafka_resp_err_t err = -12345;
 
-    if (rd_kafka_produce(rkt, partition, 0, payload, len, key, keylen, &err) == -1)
-        return rd_kafka_errno2err(err);
+    if (rd_kafka_produce(rkt, partition, RD_KAFKA_MSG_F_COPY, payload, len, key, keylen, &err) == -1)
+        /* return rd_kafka_errno2err(err); */
+        return rd_kafka_last_error();
 
     while (err == -12345)
-        rd_kafka_poll(rkt, 1000);
+        rd_kafka_poll(rk, 1000);
 
     return err;
 }
-#endif 
 
 
 int main (int argc, char** argv) {
@@ -284,6 +284,7 @@ int main (int argc, char** argv) {
     char msgbuf[MSG_BUFLEN];    /* Message value temporary buffer */
     int retval = EXIT_SUCCESS;
     long time_curr;
+    rd_kafka_resp_err_t err = -12345;
 
     if (argc < 2) {
         fprintf(stderr, "Usage: %s [.ini file]\n", argv[0]);
@@ -318,12 +319,14 @@ int main (int argc, char** argv) {
     /* Set Kafka configurations and setup callback */
     kafka_conf = rd_kafka_conf_new();
     rd_kafka_conf_set(kafka_conf, "bootstrap.servers", prod_conf.brokers, errstr, sizeof(errstr));
+    #if 0
     if (prod_conf.batch_num_messages)
         rd_kafka_conf_set(kafka_conf, "batch.num.messages", prod_conf.batch_num_messages, 
                           errstr, sizeof(errstr));
     rd_kafka_conf_set(kafka_conf, "socket.nagle.disable", "true", errstr, sizeof(errstr));
     rd_kafka_conf_set(kafka_conf, "queue.buffering.max.ms", "1", errstr, sizeof(errstr));
     rd_kafka_conf_set(kafka_conf, "socket.blocking.max.ms", "1", errstr, sizeof(errstr));
+    #endif
     rd_kafka_conf_set_dr_msg_cb(kafka_conf, msg_callback);
     
     /* Create main Kafka object */
@@ -350,20 +353,15 @@ int main (int argc, char** argv) {
             break;
         }
 
-        #if 0
-        time_curr = get_current_time_msec();        
-        if (time_curr - time_print_last > STATUS_PRINT_INTERVAL_SEC * 1000) {
-            printf("time=%ld, msgs_sent_total=%d, bytes_sent_total=%ld\n", 
-                   time_curr, msgs_sent_total, bytes_sent_total);
-            time_print_last = time_curr;
-        }
-        #endif
-
     retry:
-        /* if (sync_produce(rkt, RD_KAFKA_PARTITION_UA, RD_KAFKA_MSG_F_COPY, */
-        /*                  msgbuf, len, NULL, 0, NULL) == -1) { */
+        #ifndef ASYNC_PRODUCE
+        if (sync_produce(rk, rkt, RD_KAFKA_PARTITION_UA, msgbuf, len, NULL, 0) == -1) {
+        #else
+        /* For some reason, data transfer to Kafka is buffered and, the rate control in
+           msg_callback does not work. */
         if (rd_kafka_produce(rkt, RD_KAFKA_PARTITION_UA, RD_KAFKA_MSG_F_COPY,
-                             msgbuf, len, NULL, 0, NULL) == -1) {
+                             msgbuf, len, NULL, 0, &err) == -1) {
+        #endif /* #ifndef ASYNC_PRODUCE */
             /* /\* Failed to *enqueue* message for producing *\/ */
             /* debug("Failed to produce to topic %s: %s", */
             /*         rd_kafka_topic_name(rkt), */
