@@ -98,7 +98,7 @@ void print_config(producer_conf_t *conf) {
 static
 int parse_config(void* user, const char* section, const char* name, const char* value) {
     producer_conf_t *conf = (producer_conf_t *)user;
-    printf("section=%s, name=%s, value=%s\n", section, name, value);
+    /* printf("section=%s, name=%s, value=%s\n", section, name, value); */
 
     if (MATCH("kafka", "brokers"))           
         conf->brokers = strdup(value);
