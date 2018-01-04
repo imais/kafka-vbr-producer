@@ -36,6 +36,7 @@ typedef struct {
     char *brokers;              /* CSV list of brokers (host:port) */
     char *topic;
     char *batch_num_messages;
+    int delay_usec;
     throughput_unit_t throughput_unit;
     int throughput_interval_sec;
     char *throughput_file;
@@ -86,8 +87,8 @@ void release_config(producer_conf_t *conf) {
 static
 void print_config(producer_conf_t *conf) {
     debug("Producer started with the configurations:");
-    printf("\tbrokers=%s, topic=%s, batch.num.messages=%s\n", 
-           conf->brokers, conf->topic, conf->batch_num_messages);
+    printf("\tbrokers=%s, topic=%s, batch_num_messages=%s, delay_usec=%d\n", 
+           conf->brokers, conf->topic, conf->batch_num_messages, conf->delay_usec);
     printf("\tthroughput_unit=%s, throughput_file=%s\n",
            throughput_unit_str[conf->throughput_unit], conf->throughput_file);
     printf("\tthroughput_interval_sec=%d\n", conf->throughput_interval_sec);
@@ -103,8 +104,10 @@ int parse_config(void* user, const char* section, const char* name, const char* 
         conf->brokers = strdup(value);
     else if (MATCH("kafka", "topic"))
         conf->topic = strdup(value);
-    else if (MATCH("kafka", "batch.num.messages"))
+    else if (MATCH("kafka", "batch_num_messages"))
         conf->batch_num_messages = strdup(value);
+    else if (MATCH("kafka", "delay_usec"))
+        conf->delay_usec = atoi(value);
     else if (MATCH("throughput", "unit")) {
         if (strcasecmp(value, "bytes") == 0 || strcasecmp(value, "b") == 0)
             conf->throughput_unit = BYTES;
@@ -210,13 +213,16 @@ void msg_callback (rd_kafka_t *rk, const rd_kafka_message_t *rkmessage, void *op
         bytes_sent += rkmessage->len;
         bytes_print_sent += rkmessage->len;
         msgs_sent++;
+
+        usleep(prod_conf.delay_usec); /* delay send */
+
         time_curr = get_current_time_msec();
-        time_check_delta = time_curr - time_check_last;
-        time_print_delta = time_curr - time_print_last;
+        time_check_delta = time_curr - time_check_last; /* ms */
+        time_print_delta = time_curr - time_print_last; /* ms */
 
         if (time_print_delta >= THROUGHPUT_PRINT_INTERVAL_MSEC) {
-            debug("Throughput: target %.2f vs. actual %.2f bytes/sec",
-                  throughput_target, (float)bytes_print_sent/ (time_print_delta * 1e-3));
+            debug("Target %.2f vs. actual %.2f bytes/sec",
+                  throughput_target, (float)bytes_print_sent/ (time_print_delta * 1e-3)); /* bytes/s */
             bytes_print_sent = 0;
             time_print_last = time_curr;
         }
@@ -226,15 +232,20 @@ void msg_callback (rd_kafka_t *rk, const rd_kafka_message_t *rkmessage, void *op
                 stop(0);
                 return;
             }
-            throughput_curr = (float)bytes_sent / (time_check_delta * 1e-3);
+            throughput_curr = (float)bytes_sent / (time_check_delta * 1e-3); /* bytes/s */
 
             if (throughput_target < throughput_curr) {
                 /* Rate control: wait some time to adjust throughput */
-                time_wait = bytes_sent / throughput_target - time_check_delta;
-                debug("Throughput: target %.2f vs. actual %.2f bytes/sec, wait %ld msec",
+                time_wait = (bytes_sent / throughput_target) * 1e3 - time_check_delta; /* ms */
+                debug("Target %.2f vs. actual %.2f bytes/s, wait %ld msec",
                        throughput_target, throughput_curr, time_wait);
-                usleep(time_wait * 1000);
-                throughput_adjusted = (float)bytes_sent / (get_current_time_msec() - time_check_last);
+                if (0 < time_wait) 
+                    usleep(time_wait * 1000);
+                else
+                    debug("Skip wait due to negative wait time: %ld msec", time_wait);
+                throughput_adjusted = 
+                    (float)bytes_sent / ((get_current_time_msec() - time_check_last) * 1e-3);
+                debug("Target %.2f vs. adjusted %.2f bytes/s", throughput_target, throughput_adjusted);
             }
             bytes_sent = 0;
             msgs_sent = 0;
