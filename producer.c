@@ -56,7 +56,7 @@ static float throughput_target = 0;
 
 static char* get_formatted_time(void);
 #define debug(fmt, ...) \
-    printf("%s [%s:%d] " fmt "\n", get_formatted_time(), __FILE__, __LINE__, ##__VA_ARGS__)
+    printf("[%s] " fmt "\n", get_formatted_time(), ##__VA_ARGS__)
 
 /* https://stackoverflow.com/questions/7411301/how-to-introduce-date-and-time-in-log-file */
 static char* get_formatted_time(void) {
