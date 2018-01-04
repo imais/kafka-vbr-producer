@@ -36,6 +36,7 @@ typedef struct {
     char *brokers;              /* CSV list of brokers (host:port) */
     char *topic;
     char *batch_num_messages;
+    char *socket_nagle_disable;
     int delay_usec;
     throughput_unit_t throughput_unit;
     int throughput_interval_sec;
@@ -80,6 +81,7 @@ void release_config(producer_conf_t *conf) {
     if (conf->brokers)                  free(conf->brokers);
     if (conf->topic)                    free(conf->topic);
     if (conf->batch_num_messages)       free(conf->batch_num_messages);
+    if (conf->socket_nagle_disable)     free(conf->socket_nagle_disable);
     if (conf->throughput_file)          free(conf->throughput_file);
     if (conf->message_file)             free(conf->message_file);
 }
@@ -87,8 +89,9 @@ void release_config(producer_conf_t *conf) {
 static
 void print_config(producer_conf_t *conf) {
     debug("Producer started with the configurations:");
-    printf("\tbrokers=%s, topic=%s, batch_num_messages=%s, delay_usec=%d\n", 
-           conf->brokers, conf->topic, conf->batch_num_messages, conf->delay_usec);
+    printf("\tbrokers=%s, topic=%s, batch_num_messages=%s\n", 
+           conf->brokers, conf->topic, conf->batch_num_messages);
+    printf("\tsocket_nagle_disable=%s, delay_usec=%d\n", conf->socket_nagle_disable, conf->delay_usec);
     printf("\tthroughput_unit=%s, throughput_file=%s\n",
            throughput_unit_str[conf->throughput_unit], conf->throughput_file);
     printf("\tthroughput_interval_sec=%d\n", conf->throughput_interval_sec);
@@ -106,6 +109,8 @@ int parse_config(void* user, const char* section, const char* name, const char* 
         conf->topic = strdup(value);
     else if (MATCH("kafka", "batch_num_messages"))
         conf->batch_num_messages = strdup(value);
+    else if (MATCH("kafka", "socket_nagle_disable"))
+        conf->socket_nagle_disable = strdup(value);
     else if (MATCH("kafka", "delay_usec"))
         conf->delay_usec = atoi(value);
     else if (MATCH("throughput", "unit")) {
@@ -298,7 +303,7 @@ int main (int argc, char** argv) {
 
     /* Set Kafka configurations and setup callback */
     kafka_conf = rd_kafka_conf_new();
-    if (rd_kafka_conf_set(kafka_conf, "bootstrap.servers", prod_conf.brokers,
+    if (rd_kafka_conf_set(kafka_conf, "bootstrap.servers", prod_conf.brokers, 
                           errstr, sizeof(errstr)) != RD_KAFKA_CONF_OK) {
         debug("%s", errstr);
         retval = EXIT_FAILURE;
@@ -306,6 +311,13 @@ int main (int argc, char** argv) {
     }
     if (prod_conf.batch_num_messages &&  /* optional */
         rd_kafka_conf_set(kafka_conf, "batch.num.messages", prod_conf.batch_num_messages,
+                          errstr, sizeof(errstr)) != RD_KAFKA_CONF_OK) {
+        debug("%s", errstr);
+        retval = EXIT_FAILURE;
+        goto exit;
+    }
+    if (prod_conf.socket_nagle_disable &&  /* optional */
+        rd_kafka_conf_set(kafka_conf, "socket.nagle.disable", prod_conf.socket_nagle_disable,
                           errstr, sizeof(errstr)) != RD_KAFKA_CONF_OK) {
         debug("%s", errstr);
         retval = EXIT_FAILURE;
