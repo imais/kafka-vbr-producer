@@ -215,8 +215,8 @@ void msg_callback (rd_kafka_t *rk, const rd_kafka_message_t *rkmessage, void *op
         time_print_delta = time_curr - time_print_last;
 
         if (time_print_delta >= THROUGHPUT_PRINT_INTERVAL_MSEC) {
-            debug("Throughput : target %.2f vs. actual %.2f bytes/sec",
-                   throughput_target, (float)bytes_print_sent / time_print_delta);
+            debug("Throughput: target %.2f vs. actual %.2f bytes/sec",
+                  throughput_target, (float)bytes_print_sent/ (time_print_delta * 1e-3));
             bytes_print_sent = 0;
             time_print_last = time_curr;
         }
@@ -226,12 +226,12 @@ void msg_callback (rd_kafka_t *rk, const rd_kafka_message_t *rkmessage, void *op
                 stop(0);
                 return;
             }
-            throughput_curr = (float)bytes_sent / time_check_delta;
+            throughput_curr = (float)bytes_sent / (time_check_delta * 1e-3);
 
             if (throughput_target < throughput_curr) {
                 /* Rate control: wait some time to adjust throughput */
                 time_wait = bytes_sent / throughput_target - time_check_delta;
-                debug("Throughput : target %.2f vs. actual %.2f bytes/sec, wait %ld msec",
+                debug("Throughput: target %.2f vs. actual %.2f bytes/sec, wait %ld msec",
                        throughput_target, throughput_curr, time_wait);
                 usleep(time_wait * 1000);
                 throughput_adjusted = (float)bytes_sent / (get_current_time_msec() - time_check_last);
