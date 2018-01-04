@@ -18,6 +18,7 @@
 #define MATCH(s, n) strcasecmp(section, s) == 0 && strcasecmp(name, n) == 0
 
 #define THROUGHPUT_CHECK_INTERVAL_MSEC   100
+#define THROUGHPUT_PRINT_INTERVAL_MSEC   3000
 #define MSG_BUFLEN             512
 #define THROUGHPUT_BUFLEN      512
 
@@ -46,13 +47,32 @@ static char *message_loop_str[2] = {"false", "true"};
 /* global variables */
 static producer_conf_t prod_conf;
 static int run = 1;
-static long time_start = 0, time_lastcheck = 0, time_status_lastprint = 0;
-static long bytes_sent = 0;
+static long time_start = 0, time_check_last = 0, time_print_last = 0;
+static long bytes_sent = 0, bytes_print_sent = 0;
 static int msgs_sent = 0;
 static FILE *throughput_fp = NULL, *message_fp = NULL;
 static int throughput_lineno = 0;
 static float throughput_target = 0;
 
+static char* get_formatted_time(void);
+#define debug(fmt, ...) \
+    printf("%s [%s:%d] " fmt "\n", get_formatted_time(), __FILE__, __LINE__, ##__VA_ARGS__)
+
+/* https://stackoverflow.com/questions/7411301/how-to-introduce-date-and-time-in-log-file */
+static char* get_formatted_time(void) {
+    time_t rawtime;
+    struct tm* timeinfo;
+
+    time(&rawtime);
+    timeinfo = localtime(&rawtime);
+
+    // Must be static, otherwise won't work
+    static char _retval[20];
+    /* strftime(_retval, sizeof(_retval), "%D %H:%M:%S", timeinfo); */
+    strftime(_retval, sizeof(_retval), "%x %X", timeinfo);
+
+    return _retval;
+}
 
 static
 void release_config(producer_conf_t *conf) {
@@ -65,8 +85,9 @@ void release_config(producer_conf_t *conf) {
 
 static
 void print_config(producer_conf_t *conf) {
-    printf("Producer configurations:\n");
-    printf("\tbrokers=%s, topic=%s\n", conf->brokers, conf->topic);
+    debug("Producer started with the configurations:");
+    printf("\tbrokers=%s, topic=%s, batch.num.messages=%s\n", 
+           conf->brokers, conf->topic, conf->batch_num_messages);
     printf("\tthroughput_unit=%s, throughput_file=%s\n",
            throughput_unit_str[conf->throughput_unit], conf->throughput_file);
     printf("\tthroughput_interval_sec=%d\n", conf->throughput_interval_sec);
@@ -94,7 +115,7 @@ int parse_config(void* user, const char* section, const char* name, const char* 
         else if (strcasecmp(value, "gbytes") == 0 || strcasecmp(value, "gb") == 0)
             conf->throughput_unit = GBYTES;
         else {
-            fprintf(stderr, "%% Illegal unit option: %s\n", optarg);
+            debug("Illegal unit option: %s", optarg);
             goto illegal_config;
         }
     } 
@@ -110,7 +131,7 @@ int parse_config(void* user, const char* section, const char* name, const char* 
         else if (strcasecmp(value, "false") == 0)
             conf->message_loop = 0;
         else {
-            fprintf(stderr, "%% Illegal message loop option: %s\n", optarg);
+            debug("Illegal message loop option: %s", optarg);
             goto illegal_config;
         }
     }
@@ -125,7 +146,7 @@ illegal_config:
 
 static void stop (int signal) {
     run = 0;
-    fprintf(stderr, "%% Stopping producer...\n");
+    debug("Stopping producer...");
 }
 
 static long get_current_time_msec() {
@@ -146,9 +167,9 @@ static float get_throughput_target(long time_curr) {
     while (throughput_lineno < lineno) {
         if (fgets(buf, THROUGHPUT_BUFLEN, throughput_fp) == NULL) {
             if (ferror(throughput_fp))
-                fprintf(stderr, "%% Failed to read throughput file\n");
+                debug("Failed to read throughput file");
             else if (feof(throughput_fp))
-                fprintf(stderr, "%% Reached end of throughput file\n");
+                debug("Reached end of throughput file");
             return -1;
         }
         throughput_lineno++;
@@ -163,11 +184,11 @@ static float get_throughput_target(long time_curr) {
 static int read_message(char *buf) {
     while (fgets(buf, MSG_BUFLEN, message_fp) == NULL) {
         if (feof(message_fp) && prod_conf.message_loop) {
-            fprintf(stderr, "%% Message file reached eof, rewinded to the beginning of the file\n");
+            debug("Message file reached eof, rewinded to the beginning of the file");
             rewind(message_fp);
         }
         else if (ferror(message_fp)) {
-            fprintf(stderr, "%% Failed to read throughput file\n");
+            debug("Failed to read throughput file");
             return 0;
         }
     }
@@ -177,39 +198,47 @@ static int read_message(char *buf) {
 static 
 void msg_callback (rd_kafka_t *rk, const rd_kafka_message_t *rkmessage, void *opaque) {
     /* NOTE: This function is called in the context of main thread */
-    long time_curr, time_delta, time_wait;
-    float throughput_target, throughput_curr, throughput_adjusted;
+    long time_curr, time_check_delta, time_print_delta, time_wait;
+    float throughput_curr, throughput_adjusted;
     
     if (!run)
         return;
 
     if (rkmessage->err)
-        fprintf(stderr, "%% Message delivery failed: %s\n", rd_kafka_err2str(rkmessage->err));
+        debug("Message delivery failed: %s", rd_kafka_err2str(rkmessage->err));
     else {
         bytes_sent += rkmessage->len;
+        bytes_print_sent += rkmessage->len;
         msgs_sent++;
         time_curr = get_current_time_msec();
-        time_delta = time_curr - time_lastcheck;
+        time_check_delta = time_curr - time_check_last;
+        time_print_delta = time_curr - time_print_last;
 
-        if (time_delta >= THROUGHPUT_CHECK_INTERVAL_MSEC) {
+        if (time_print_delta >= THROUGHPUT_PRINT_INTERVAL_MSEC) {
+            debug("Throughput : target %.2f vs. actual %.2f bytes/sec",
+                   throughput_target, (float)bytes_print_sent / time_print_delta);
+            bytes_print_sent = 0;
+            time_print_last = time_curr;
+        }
+
+        if (time_check_delta >= THROUGHPUT_CHECK_INTERVAL_MSEC) {
             if ((throughput_target = get_throughput_target(time_curr)) < 0) {
                 stop(0);
                 return;
             }
-            throughput_curr = (float)bytes_sent / time_delta;
+            throughput_curr = (float)bytes_sent / time_check_delta;
 
             if (throughput_target < throughput_curr) {
                 /* Rate control: wait some time to adjust throughput */
-                time_wait = bytes_sent / throughput_target - time_delta;
-                /* printf("Sent %d msgs (%ld bytes) in %ld ms, tp(tgt: %.2f, cur: %.2f bytes/s), t_wait = %ld ms\n", msgs_sent, bytes_sent, time_delta, throughput_target, throughput_curr, time_wait); */
+                time_wait = bytes_sent / throughput_target - time_check_delta;
+                debug("Throughput : target %.2f vs. actual %.2f bytes/sec, wait %ld msec",
+                       throughput_target, throughput_curr, time_wait);
                 usleep(time_wait * 1000);
-                throughput_adjusted = (float)bytes_sent / (get_current_time_msec() - time_lastcheck);
-                printf("Throughput: target %.2f vs. adjusted %.2f bytes/s\n",
-                       throughput_target, throughput_adjusted);
+                throughput_adjusted = (float)bytes_sent / (get_current_time_msec() - time_check_last);
             }
             bytes_sent = 0;
             msgs_sent = 0;
-            time_lastcheck = time_curr;
+            time_check_last = time_curr;
         }
     }
 
@@ -230,8 +259,7 @@ int main (int argc, char** argv) {
         fprintf(stderr, "Usage: %s [.ini file]\n", argv[0]);
         exit(EXIT_FAILURE);
     }
-
-    printf("main thread ID: %u\n", (unsigned int)pthread_self());
+    /* printf("Main thread ID: %u\n", (unsigned int)pthread_self()); */
 
     /* Signal handler for clean shutdown */
     signal(SIGINT, stop);    
@@ -239,20 +267,20 @@ int main (int argc, char** argv) {
     /* Initialize producer configurations */
     bzero(&prod_conf, sizeof(producer_conf_t));
     if (ini_parse(argv[1], parse_config, &prod_conf) != SUCCESS) {
-        fprintf(stderr, "%% Failed parsing %s\n", argv[1]);
+        debug("Failed parsing %s", argv[1]);
         exit(EXIT_FAILURE);
     }
     print_config(&prod_conf);
-    time_start = time_lastcheck = get_current_time_msec();
+    time_start = time_check_last = time_print_last = get_current_time_msec();
     
     /* Open throughput and message files */
     if ((throughput_fp = fopen(prod_conf.throughput_file, "r")) == NULL) {
-        fprintf(stderr, "%% Failed opening %s\n", prod_conf.throughput_file);
+        debug("Failed opening %s", prod_conf.throughput_file);
         retval = EXIT_FAILURE;
         goto exit;
     }
     if ((message_fp = fopen(prod_conf.message_file, "r")) == NULL) {
-        fprintf(stderr, "%% Failed opening %s\n", prod_conf.message_file);
+        debug("Failed opening %s", prod_conf.message_file);
         retval = EXIT_FAILURE;
         goto exit;
     }
@@ -261,13 +289,14 @@ int main (int argc, char** argv) {
     kafka_conf = rd_kafka_conf_new();
     if (rd_kafka_conf_set(kafka_conf, "bootstrap.servers", prod_conf.brokers,
                           errstr, sizeof(errstr)) != RD_KAFKA_CONF_OK) {
-        fprintf(stderr, "%% %s\n", errstr);
+        debug("%s", errstr);
         retval = EXIT_FAILURE;
         goto exit;
     }
-    if (rd_kafka_conf_set(kafka_conf, "batch.num.messages", prod_conf.batch_num_messages,
+    if (prod_conf.batch_num_messages &&  /* optional */
+        rd_kafka_conf_set(kafka_conf, "batch.num.messages", prod_conf.batch_num_messages,
                           errstr, sizeof(errstr)) != RD_KAFKA_CONF_OK) {
-        fprintf(stderr, "%% %s\n", errstr);
+        debug("%s", errstr);
         retval = EXIT_FAILURE;
         goto exit;
     }
@@ -276,7 +305,7 @@ int main (int argc, char** argv) {
     /* Create main Kafka object */
     rk = rd_kafka_new(RD_KAFKA_PRODUCER, kafka_conf, errstr, sizeof(errstr));
     if (!rk) {
-        fprintf(stderr, "%% Failed to create new producer: %s\n", errstr);
+        debug("Failed to create new producer: %s", errstr);
         retval = EXIT_FAILURE;
         goto exit;
     } 
@@ -284,7 +313,7 @@ int main (int argc, char** argv) {
     /* Create Kafka topic */
     rkt = rd_kafka_topic_new(rk, prod_conf.topic, NULL);
     if (!rkt) {
-        fprintf(stderr, "%% Failed to create topic object: %s\n",
+        debug("Failed to create topic object: %s",
                 rd_kafka_err2str(rd_kafka_last_error()));
         retval = EXIT_FAILURE;
         goto exit;
@@ -293,16 +322,16 @@ int main (int argc, char** argv) {
     while (run) {
         size_t len = read_message(msgbuf);
         if (len == 0) {
-            fprintf(stderr, "%% Finished reading all messages");
+            debug("Finished reading all messages");
             break;
         }
 
         #if 0
         time_curr = get_current_time_msec();        
-        if (time_curr - time_status_lastprint > STATUS_PRINT_INTERVAL_SEC * 1000) {
+        if (time_curr - time_print_last > STATUS_PRINT_INTERVAL_SEC * 1000) {
             printf("time=%ld, msgs_sent_total=%d, bytes_sent_total=%ld\n", 
                    time_curr, msgs_sent_total, bytes_sent_total);
-            time_status_lastprint = time_curr;
+            time_print_last = time_curr;
         }
         #endif
 
@@ -310,7 +339,7 @@ int main (int argc, char** argv) {
         if (rd_kafka_produce(rkt, RD_KAFKA_PARTITION_UA, RD_KAFKA_MSG_F_COPY,
                              msgbuf, len, NULL, 0, NULL) == -1) {
             /* /\* Failed to *enqueue* message for producing *\/ */
-            /* fprintf(stderr, "%% Failed to produce to topic %s: %s\n", */
+            /* debug("Failed to produce to topic %s: %s", */
             /*         rd_kafka_topic_name(rkt), */
             /*         rd_kafka_err2str(rd_kafka_last_error())); */
 
@@ -322,14 +351,14 @@ int main (int argc, char** argv) {
         } 
         #if 0
         else {
-            fprintf(stderr, "%% Enqueued message (%zd bytes) for topic %s\n",
+            debug("Enqueued message (%zd bytes) for topic %s",
                     len, rd_kafka_topic_name(rkt));
         }
         #endif
         rd_kafka_poll(rk, 0 /*non-blocking*/);
     }    
 
-    fprintf(stderr, "%% Flushing final messages..\n");
+    debug("Flushing final messages..");
     rd_kafka_flush(rk, 10*1000 /* wait for max 10 seconds */);
 
 exit:
@@ -344,7 +373,7 @@ exit:
     if (message_fp)
         fclose(message_fp);    
 
-    printf("All done!\n");
+    debug("All done!");
 
     return retval;
 }
