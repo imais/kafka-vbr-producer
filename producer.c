@@ -19,8 +19,8 @@
 
 #define THROUGHPUT_CHECK_INTERVAL_MSEC   100
 #define THROUGHPUT_PRINT_INTERVAL_MSEC   3000
-#define MSG_BUFLEN             512
-#define THROUGHPUT_BUFLEN      512
+#define MSG_BUFLEN             2048     /* Make it large enough to fit one line of data */
+#define THROUGHPUT_BUFLEN      32
 
 
 typedef enum {
